@@ -21,7 +21,9 @@
 #include <apt-pkg/fileutl.h>
 #include <apt-pkg/pkgcache.h>
 #include <apt-pkg/policy.h>
+#include <apt-pkg/string_view.h>
 #include <apt-pkg/strutl.h>
+#include <apt-pkg/tagfile-keys.h>
 #include <apt-pkg/tagfile.h>
 #include <apt-pkg/version.h>
 #include <apt-pkg/versionmatch.h>
@@ -286,6 +288,13 @@ void pkgPolicy::CreatePin(pkgVersionMatch::MatchType Type,string Name,
 // Returns true if this update is excluded by phasing.
 static inline bool ExcludePhased(std::string machineID, pkgCache::VerIterator const &Ver)
 {
+   if (Ver.PhasedUpdatePercentage() == 100)
+      return false;
+
+   // FIXME: We have migrated to a legacy implementation until LP: #1929082 is fixed
+   if (not _config->FindB("APT::Get::Phase-Policy", false))
+      return false;
+
    // The order and fallbacks for the always/never checks come from update-manager and exist
    // to preserve compatibility.
    if (_config->FindB("APT::Get::Always-Include-Phased-Updates",
@@ -310,11 +319,9 @@ static inline bool ExcludePhased(std::string machineID, pkgCache::VerIterator co
 }
 APT_PURE signed short pkgPolicy::GetPriority(pkgCache::VerIterator const &Ver, bool ConsiderFiles)
 {
-   if (Ver.PhasedUpdatePercentage() != 100)
-   {
-      if (ExcludePhased(d->machineID, Ver))
-	 return 1;
-   }
+   auto ceiling = std::numeric_limits<signed int>::max();
+   if (ExcludePhased(d->machineID, Ver))
+      ceiling = 1;
    if (VerPins[Ver->ID].Type != pkgVersionMatch::None)
    {
       // If all sources are never pins, the never pin wins.
@@ -322,10 +329,10 @@ APT_PURE signed short pkgPolicy::GetPriority(pkgCache::VerIterator const &Ver, b
 	 return NEVER_PIN;
       for (pkgCache::VerFileIterator file = Ver.FileList(); file.end() == false; file++)
 	 if (GetPriority(file.File()) != NEVER_PIN)
-	    return VerPins[Ver->ID].Priority;
+	    return std::min((int)VerPins[Ver->ID].Priority, ceiling);
    }
    if (!ConsiderFiles)
-      return 0;
+      return std::min(0, ceiling);
 
    // priorities are short ints, but we want to pick a value outside the valid range here
    auto priority = std::numeric_limits<signed int>::min();
@@ -342,7 +349,7 @@ APT_PURE signed short pkgPolicy::GetPriority(pkgCache::VerIterator const &Ver, b
 	 priority = std::max<decltype(priority)>(priority, GetPriority(file.File()));
    }
 
-   return priority == std::numeric_limits<decltype(priority)>::min() ? 0 : priority;
+   return std::min(priority == std::numeric_limits<decltype(priority)>::min() ? 0 : priority, ceiling);
 }
 APT_PURE signed short pkgPolicy::GetPriority(pkgCache::PkgFileIterator const &File)
 {
@@ -425,12 +432,12 @@ bool ReadPinFile(pkgPolicy &Plcy,string File)
       if (Tags.Count() == 0)
          continue;
 
-      string Name = Tags.FindS("Package");
-      if (Name.empty() == true)
+      auto Name = Tags.Find(pkgTagSection::Key::Package);
+      if (Name.empty())
 	 return _error->Error(_("Invalid record in the preferences file %s, no Package header"), File.c_str());
       if (Name == "*")
-	 Name = string();
-      
+	 Name = APT::StringView{};
+
       const char *Start;
       const char *End;
       if (Tags.Find("Pin",Start,End) == false)
@@ -479,7 +486,7 @@ bool ReadPinFile(pkgPolicy &Plcy,string File)
          return _error->Error(_("No priority (or zero) specified for pin"));
       }
 
-      istringstream s(Name);
+      std::istringstream s(Name.to_string());
       string pkg;
       while(!s.eof())
       {
